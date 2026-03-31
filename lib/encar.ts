@@ -6,6 +6,7 @@ export const ENCAR_IMAGE_BASE = "https://ci.encar.com/carpicture";
 export const ENCAR_DETAIL_BASE =
   "https://www.encar.com/dc/dc_cardetailview.do?carType=kor&carid=";
 export const ENCAR_DAILY_REVALIDATE_SECONDS = 60 * 60 * 24;
+export const ENCAR_CACHE_TAG = "inventory";
 const FALLBACK_IMAGE =
   "data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 1200 900'%3E%3Crect width='1200' height='900' fill='%23e8dece'/%3E%3Ccircle cx='962' cy='190' r='124' fill='%23bf9152' fill-opacity='.18'/%3E%3Cpath d='M160 664l166-198a36 36 0 0 1 56 0l114 136 172-208a36 36 0 0 1 56 0l316 370H160Z' fill='%23151515' fill-opacity='.16'/%3E%3Ctext x='160' y='208' fill='%23151515' fill-opacity='.75' font-family='Arial, sans-serif' font-size='76' font-weight='700'%3EMillion Miles%3C/text%3E%3Ctext x='160' y='286' fill='%236d655c' font-family='Arial, sans-serif' font-size='34'%3EImage temporarily unavailable%3C/text%3E%3C/svg%3E";
 
@@ -200,6 +201,7 @@ export async function fetchLiveInventory(limit = 18): Promise<InventoryPayload> 
     },
     next: {
       revalidate: ENCAR_DAILY_REVALIDATE_SECONDS,
+      tags: [ENCAR_CACHE_TAG],
     },
   });
 

@@ -1,6 +1,8 @@
 import { CarCard } from "@/components/car-card";
 import { getInventory } from "@/lib/data";
 
+export const dynamic = "force-dynamic";
+
 export default async function Home() {
   const inventory = await getInventory(18);
 
@@ -99,7 +101,7 @@ export default async function Home() {
 
             <a
               href="/api/cars"
-              className="mt-6 inline-flex items-center justify-center rounded-full bg-[var(--color-ink)] px-5 py-3 text-sm font-semibold uppercase tracking-[0.18em] text-white transition-transform duration-300 hover:-translate-y-0.5"
+              className="mt-6 inline-flex items-center justify-center rounded-full border border-[#bf9152] bg-[#bf9152] px-5 py-3 text-sm font-semibold uppercase tracking-[0.18em] text-[#151515] transition-all duration-300 hover:-translate-y-0.5 hover:bg-[#cfa169]"
             >
               Open inventory API
             </a>

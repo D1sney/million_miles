@@ -84,7 +84,7 @@ export function CarCard({ car }: CarCardProps) {
             href={car.sourceUrl}
             target="_blank"
             rel="noreferrer"
-            className="inline-flex items-center justify-center rounded-full bg-[var(--color-ink)] px-4 py-3 text-xs font-semibold uppercase tracking-[0.18em] text-white transition-colors hover:bg-[var(--color-accent-strong)]"
+            className="inline-flex items-center justify-center rounded-full border border-[#bf9152] bg-[#bf9152] px-4 py-3 text-xs font-semibold uppercase tracking-[0.18em] text-[#151515] transition-all hover:bg-[#cfa169]"
           >
             View on ENCAR
           </a>

@@ -1,0 +1,25 @@
+import { revalidatePath, revalidateTag } from "next/cache";
+import { fetchLiveInventory, ENCAR_CACHE_TAG } from "@/lib/encar";
+
+export async function GET(request: Request) {
+  const authHeader = request.headers.get("authorization");
+  const cronSecret = process.env.CRON_SECRET;
+
+  if (cronSecret && authHeader !== `Bearer ${cronSecret}`) {
+    return Response.json({ ok: false, error: "Unauthorized" }, { status: 401 });
+  }
+
+  revalidateTag(ENCAR_CACHE_TAG, "max");
+  revalidatePath("/");
+  revalidatePath("/api/cars");
+
+  const inventory = await fetchLiveInventory(18);
+
+  return Response.json({
+    ok: true,
+    refreshedAt: new Date().toISOString(),
+    source: inventory.meta.source,
+    sourceCount: inventory.meta.sourceCount,
+    displayedCount: inventory.meta.displayedCount,
+  });
+}
