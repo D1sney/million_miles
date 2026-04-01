@@ -229,30 +229,32 @@ async function fetchEncarChunk(skip: number, limit: number): Promise<RawResponse
 
 export async function fetchLiveInventory(limit = ENCAR_SYNC_LIMIT): Promise<InventoryPayload> {
   const targetCount = Math.max(1, limit);
-  const chunks = Math.ceil(targetCount / ENCAR_CHUNK_SIZE);
-  const aggregated: RawCar[] = [];
+  const deduped = new Map<string, RawCar>();
   let sourceCount = 0;
+  let skip = 0;
+  let safetyCounter = 0;
 
-  for (let index = 0; index < chunks; index += 1) {
-    const skip = index * ENCAR_CHUNK_SIZE;
-    const currentLimit = Math.min(ENCAR_CHUNK_SIZE, targetCount - aggregated.length);
+  while (deduped.size < targetCount) {
+    const currentLimit = ENCAR_CHUNK_SIZE;
     const raw = await fetchEncarChunk(skip, currentLimit);
     sourceCount = raw.Count;
-    aggregated.push(...raw.SearchResults);
+    for (const car of raw.SearchResults) {
+      deduped.set(car.Id, car);
+    }
+    skip += currentLimit;
+    safetyCounter += 1;
 
-    if (aggregated.length >= targetCount || raw.SearchResults.length < currentLimit) {
+    if (raw.SearchResults.length < currentLimit || skip >= sourceCount || safetyCounter > 50) {
       break;
     }
   }
 
-  const deduped = Array.from(
-    new Map(aggregated.map((car) => [car.Id, car])).values(),
-  ).slice(0, targetCount);
+  const cars = Array.from(deduped.values()).slice(0, targetCount);
 
   return normalizeResponse(
     {
       Count: sourceCount,
-      SearchResults: deduped,
+      SearchResults: cars,
     },
     "live",
   );

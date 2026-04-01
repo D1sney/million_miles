@@ -67,13 +67,13 @@ function normalizeCar(raw) {
 }
 
 async function main() {
-  const aggregated = [];
+  const deduped = new Map();
   let sourceCount = 0;
-  const chunks = Math.ceil(Math.max(1, LIMIT) / CHUNK_SIZE);
+  let skip = 0;
+  let safetyCounter = 0;
 
-  for (let index = 0; index < chunks; index += 1) {
-    const skip = index * CHUNK_SIZE;
-    const currentLimit = Math.min(CHUNK_SIZE, LIMIT - aggregated.length);
+  while (deduped.size < LIMIT) {
+    const currentLimit = CHUNK_SIZE;
     const url = new URL(ENCAR_ENDPOINT);
     url.searchParams.set("count", "true");
     url.searchParams.set("q", ENCAR_QUERY);
@@ -92,16 +92,22 @@ async function main() {
 
     const rawChunk = await response.json();
     sourceCount = rawChunk.Count || sourceCount;
-    aggregated.push(...(rawChunk.SearchResults || []));
+    for (const car of rawChunk.SearchResults || []) {
+      deduped.set(car.Id, car);
+    }
+    skip += currentLimit;
+    safetyCounter += 1;
 
-    if (aggregated.length >= LIMIT || (rawChunk.SearchResults || []).length < currentLimit) {
+    if (
+      (rawChunk.SearchResults || []).length < currentLimit ||
+      skip >= sourceCount ||
+      safetyCounter > 50
+    ) {
       break;
     }
   }
 
-  const cars = Array.from(new Map(aggregated.map((car) => [car.Id, car])).values())
-    .slice(0, LIMIT)
-    .map(normalizeCar);
+  const cars = Array.from(deduped.values()).slice(0, LIMIT).map(normalizeCar);
   const fetchedAt = new Date().toISOString();
 
   const payload = {
