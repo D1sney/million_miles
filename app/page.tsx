@@ -62,6 +62,13 @@ export default async function Home({ searchParams }: PageProps) {
   const rawSearchParams = (await searchParams) ?? {};
   const catalog = await getCatalog(parseCatalogQuery(rawSearchParams));
   const { inventory, filters, query, pagination, cars } = catalog;
+  const filterStateKey = [
+    query.page,
+    query.brand,
+    query.fuel,
+    query.yearFrom,
+    query.maxPriceManWon,
+  ].join(":");
 
   return (
     <main className="relative flex-1 overflow-hidden">
@@ -184,6 +191,7 @@ export default async function Home({ searchParams }: PageProps) {
           </div>
 
           <form
+            key={filterStateKey}
             className="mb-8 grid gap-4 rounded-[2rem] border border-[var(--color-line)] bg-[var(--color-paper)] p-5 shadow-[var(--shadow-soft)] md:grid-cols-4"
             method="get"
           >
@@ -314,8 +322,8 @@ export default async function Home({ searchParams }: PageProps) {
                   href={buildHref(query, { page: pageNumber })}
                   className={`inline-flex size-12 items-center justify-center rounded-full text-sm font-semibold ${
                     pageNumber === pagination.page
-                      ? "bg-[#151515] text-white"
-                      : "border border-[var(--color-line)] bg-white text-[var(--color-ink)]"
+                      ? "border border-[#bf9152] bg-[#bf9152] text-[#151515] shadow-[0_10px_30px_rgba(191,145,82,0.28)]"
+                      : "border border-[var(--color-line)] bg-white text-[var(--color-ink)] hover:border-[var(--color-accent)]"
                   }`}
                 >
                   {pageNumber}
