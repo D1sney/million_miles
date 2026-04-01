@@ -73,6 +73,14 @@ export type InventoryPayload = {
   };
 };
 
+export type InventoryBatchResult = {
+  inventory: InventoryPayload;
+  nextSkip: number;
+  requestedSkip: number;
+  requestedLimit: number;
+  exhausted: boolean;
+};
+
 function formatKrw(value: number) {
   return new Intl.NumberFormat("en-US", {
     style: "currency",
@@ -151,6 +159,48 @@ function normalizeResponse(raw: RawResponse, source: "live" | "snapshot"): Inven
       }).format(new Date(fetchedAt)),
       query: ENCAR_QUERY,
     },
+  };
+}
+
+export async function fetchInventoryBatch(skip: number, limit: number): Promise<InventoryBatchResult> {
+  const safeSkip = Math.max(0, skip);
+  const targetCount = Math.max(1, limit);
+  const deduped = new Map<string, RawCar>();
+  let sourceCount = 0;
+  let currentSkip = safeSkip;
+  let safetyCounter = 0;
+
+  while (deduped.size < targetCount) {
+    const currentLimit = Math.min(ENCAR_CHUNK_SIZE, targetCount);
+    const raw = await fetchEncarChunk(currentSkip, currentLimit);
+    sourceCount = raw.Count;
+    for (const car of raw.SearchResults) {
+      deduped.set(car.Id, car);
+    }
+    currentSkip += currentLimit;
+    safetyCounter += 1;
+
+    if (
+      raw.SearchResults.length < currentLimit ||
+      currentSkip >= sourceCount ||
+      safetyCounter > Math.ceil(targetCount / ENCAR_CHUNK_SIZE) + 5
+    ) {
+      break;
+    }
+  }
+
+  return {
+    inventory: normalizeResponse(
+      {
+        Count: sourceCount,
+        SearchResults: Array.from(deduped.values()).slice(0, targetCount),
+      },
+      "live",
+    ),
+    nextSkip: currentSkip,
+    requestedSkip: safeSkip,
+    requestedLimit: targetCount,
+    exhausted: currentSkip >= sourceCount,
   };
 }
 

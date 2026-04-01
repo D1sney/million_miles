@@ -4,7 +4,7 @@ import {
   ENCAR_SYNC_LIMIT,
   type InventoryCar,
   type InventoryPayload,
-  fetchLiveInventory,
+  fetchInventoryBatch,
 } from "@/lib/encar";
 
 type CatalogQueryInput = {
@@ -61,7 +61,38 @@ type SyncStateRow = {
   synced_count: number;
   fetched_at: string | Date;
   query: string;
+  backfill_offset: number;
+  backfill_complete: boolean;
+  backfill_batch_size: number;
+  recent_refresh_limit: number;
+  last_backfill_at: string | Date | null;
+  last_refresh_at: string | Date | null;
 };
+
+type SyncMode = "status" | "refresh" | "backfill" | "scheduled";
+
+type SyncSummary = {
+  mode: SyncMode;
+  fetchedAt: string;
+  sourceCount: number;
+  syncedCount: number;
+  batchSize: number;
+  batchCars: number;
+  backfillOffset: number;
+  backfillComplete: boolean;
+};
+
+type ScheduledSyncResult = {
+  actions: string[];
+  state: SyncStateRow;
+  inventory: InventoryPayload;
+  refresh?: SyncSummary | null;
+  backfill?: SyncSummary | null;
+};
+
+const SYNC_STATE_KEY = "primary";
+const DEFAULT_BACKFILL_BATCH_SIZE = 3000;
+const DEFAULT_REFRESH_LIMIT = ENCAR_SYNC_LIMIT;
 
 function getSql() {
   const databaseUrl = process.env.DATABASE_URL;
@@ -103,6 +134,31 @@ function rowToCar(row: InventoryRow): InventoryCar {
   };
 }
 
+function normalizeState(row: SyncStateRow): SyncStateRow {
+  return {
+    ...row,
+    backfill_offset: Number(row.backfill_offset ?? 0),
+    source_count: Number(row.source_count ?? 0),
+    synced_count: Number(row.synced_count ?? 0),
+    backfill_batch_size: Number(row.backfill_batch_size ?? DEFAULT_BACKFILL_BATCH_SIZE),
+    recent_refresh_limit: Number(row.recent_refresh_limit ?? DEFAULT_REFRESH_LIMIT),
+    backfill_complete: Boolean(row.backfill_complete),
+  };
+}
+
+async function countActiveCars() {
+  const sql = getSql();
+  const rows = (await sql.query(
+    `
+      SELECT COUNT(*)::int AS total
+      FROM inventory_cars
+      WHERE is_active = TRUE
+    `,
+  )) as Array<{ total: number }>;
+
+  return Number(rows[0]?.total ?? 0);
+}
+
 async function ensureTables() {
   const sql = getSql();
 
@@ -126,8 +182,32 @@ async function ensureTables() {
       image_url TEXT NOT NULL,
       source_url TEXT NOT NULL,
       source_modified_at TIMESTAMPTZ NOT NULL,
-      synced_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+      synced_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+      first_seen_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+      last_seen_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+      is_active BOOLEAN NOT NULL DEFAULT TRUE
     )
+  `);
+
+  await sql.query(`
+    ALTER TABLE inventory_cars
+    ADD COLUMN IF NOT EXISTS first_seen_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+  `);
+  await sql.query(`
+    ALTER TABLE inventory_cars
+    ADD COLUMN IF NOT EXISTS last_seen_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+  `);
+  await sql.query(`
+    ALTER TABLE inventory_cars
+    ADD COLUMN IF NOT EXISTS is_active BOOLEAN NOT NULL DEFAULT TRUE
+  `);
+  await sql.query(`
+    UPDATE inventory_cars
+    SET
+      first_seen_at = COALESCE(first_seen_at, synced_at, NOW()),
+      last_seen_at = COALESCE(last_seen_at, synced_at, NOW()),
+      is_active = COALESCE(is_active, TRUE)
+    WHERE first_seen_at IS NULL OR last_seen_at IS NULL OR is_active IS NULL
   `);
 
   await sql.query(`
@@ -136,9 +216,78 @@ async function ensureTables() {
       source_count INTEGER NOT NULL,
       synced_count INTEGER NOT NULL,
       fetched_at TIMESTAMPTZ NOT NULL,
-      query TEXT NOT NULL
+      query TEXT NOT NULL,
+      backfill_offset INTEGER NOT NULL DEFAULT 0,
+      backfill_complete BOOLEAN NOT NULL DEFAULT FALSE,
+      backfill_batch_size INTEGER NOT NULL DEFAULT ${DEFAULT_BACKFILL_BATCH_SIZE},
+      recent_refresh_limit INTEGER NOT NULL DEFAULT ${DEFAULT_REFRESH_LIMIT},
+      last_backfill_at TIMESTAMPTZ,
+      last_refresh_at TIMESTAMPTZ
     )
   `);
+
+  await sql.query(`
+    ALTER TABLE inventory_sync_state
+    ADD COLUMN IF NOT EXISTS backfill_offset INTEGER NOT NULL DEFAULT 0
+  `);
+  await sql.query(`
+    ALTER TABLE inventory_sync_state
+    ADD COLUMN IF NOT EXISTS backfill_complete BOOLEAN NOT NULL DEFAULT FALSE
+  `);
+  await sql.query(`
+    ALTER TABLE inventory_sync_state
+    ADD COLUMN IF NOT EXISTS backfill_batch_size INTEGER NOT NULL DEFAULT ${DEFAULT_BACKFILL_BATCH_SIZE}
+  `);
+  await sql.query(`
+    ALTER TABLE inventory_sync_state
+    ADD COLUMN IF NOT EXISTS recent_refresh_limit INTEGER NOT NULL DEFAULT ${DEFAULT_REFRESH_LIMIT}
+  `);
+  await sql.query(`
+    ALTER TABLE inventory_sync_state
+    ADD COLUMN IF NOT EXISTS last_backfill_at TIMESTAMPTZ
+  `);
+  await sql.query(`
+    ALTER TABLE inventory_sync_state
+    ADD COLUMN IF NOT EXISTS last_refresh_at TIMESTAMPTZ
+  `);
+
+  await sql.query(
+    `
+      INSERT INTO inventory_sync_state (
+        key_name, source_count, synced_count, fetched_at, query,
+        backfill_offset, backfill_complete, backfill_batch_size, recent_refresh_limit,
+        last_backfill_at, last_refresh_at
+      )
+      VALUES ('primary', 0, 0, NOW(), $1, 0, FALSE, $2, $3, NULL, NULL)
+      ON CONFLICT (key_name) DO NOTHING
+    `,
+    [ENCAR_QUERY, DEFAULT_BACKFILL_BATCH_SIZE, DEFAULT_REFRESH_LIMIT],
+  );
+
+  await sql.query(
+    `
+      UPDATE inventory_sync_state
+      SET
+        query = COALESCE(NULLIF(query, ''), $1),
+        backfill_offset = CASE
+          WHEN last_backfill_at IS NULL AND backfill_offset = 0 AND synced_count > 0
+            THEN LEAST(COALESCE(synced_count, 0), COALESCE(source_count, 0))
+          ELSE COALESCE(
+            backfill_offset,
+            LEAST(COALESCE(synced_count, 0), COALESCE(source_count, 0))
+          )
+        END,
+        backfill_complete = CASE
+          WHEN COALESCE(source_count, 0) > 0 AND COALESCE(synced_count, 0) >= COALESCE(source_count, 0)
+            THEN TRUE
+          ELSE COALESCE(backfill_complete, FALSE)
+        END,
+        backfill_batch_size = COALESCE(backfill_batch_size, $2),
+        recent_refresh_limit = COALESCE(recent_refresh_limit, $3)
+      WHERE key_name = 'primary'
+    `,
+    [ENCAR_QUERY, DEFAULT_BACKFILL_BATCH_SIZE, DEFAULT_REFRESH_LIMIT],
+  );
 
   await sql.query(`CREATE INDEX IF NOT EXISTS inventory_cars_brand_idx ON inventory_cars (brand)`);
   await sql.query(`CREATE INDEX IF NOT EXISTS inventory_cars_fuel_idx ON inventory_cars (fuel_type)`);
@@ -151,20 +300,197 @@ async function ensureTables() {
     CREATE INDEX IF NOT EXISTS inventory_cars_modified_idx
     ON inventory_cars (source_modified_at DESC)
   `);
+  await sql.query(`
+    CREATE INDEX IF NOT EXISTS inventory_cars_active_modified_idx
+    ON inventory_cars (is_active, source_modified_at DESC)
+  `);
 }
 
 async function readSyncState() {
+  await ensureTables();
+
   const sql = getSql();
   const rows = (await sql.query(
     `
-      SELECT key_name, source_count, synced_count, fetched_at, query
+      SELECT
+        key_name,
+        source_count,
+        synced_count,
+        fetched_at,
+        query,
+        backfill_offset,
+        backfill_complete,
+        backfill_batch_size,
+        recent_refresh_limit,
+        last_backfill_at,
+        last_refresh_at
       FROM inventory_sync_state
-      WHERE key_name = 'primary'
+      WHERE key_name = $1
       LIMIT 1
     `,
+    [SYNC_STATE_KEY],
   )) as SyncStateRow[];
 
-  return rows[0] ?? null;
+  if (!rows[0]) {
+    throw new Error("Inventory sync state is missing");
+  }
+
+  return normalizeState(rows[0]);
+}
+
+async function saveSyncState(state: SyncStateRow) {
+  const sql = getSql();
+
+  await sql.query(
+    `
+      INSERT INTO inventory_sync_state (
+        key_name,
+        source_count,
+        synced_count,
+        fetched_at,
+        query,
+        backfill_offset,
+        backfill_complete,
+        backfill_batch_size,
+        recent_refresh_limit,
+        last_backfill_at,
+        last_refresh_at
+      )
+      VALUES (
+        $1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11
+      )
+      ON CONFLICT (key_name) DO UPDATE SET
+        source_count = EXCLUDED.source_count,
+        synced_count = EXCLUDED.synced_count,
+        fetched_at = EXCLUDED.fetched_at,
+        query = EXCLUDED.query,
+        backfill_offset = EXCLUDED.backfill_offset,
+        backfill_complete = EXCLUDED.backfill_complete,
+        backfill_batch_size = EXCLUDED.backfill_batch_size,
+        recent_refresh_limit = EXCLUDED.recent_refresh_limit,
+        last_backfill_at = EXCLUDED.last_backfill_at,
+        last_refresh_at = EXCLUDED.last_refresh_at
+    `,
+    [
+      state.key_name,
+      state.source_count,
+      state.synced_count,
+      state.fetched_at,
+      state.query,
+      state.backfill_offset,
+      state.backfill_complete,
+      state.backfill_batch_size,
+      state.recent_refresh_limit,
+      state.last_backfill_at,
+      state.last_refresh_at,
+    ],
+  );
+}
+
+async function upsertCars(cars: InventoryCar[], seenAt: string) {
+  if (cars.length === 0) {
+    return;
+  }
+
+  const sql = getSql();
+  const payload = JSON.stringify(
+    cars.map((car) => ({
+      id: car.id,
+      title: car.title,
+      brand: car.brand,
+      model: car.model,
+      trim: car.trim,
+      year: car.year,
+      mileage_km: car.mileageKm,
+      price_krw: car.priceKrw,
+      price_label: car.priceLabel,
+      source_price_man_won: car.sourcePriceManWon,
+      source_price_label: car.sourcePriceLabel,
+      fuel_type: car.fuelType,
+      transmission: car.transmission,
+      location: car.location,
+      dealer_name: car.dealerName,
+      image_url: car.imageUrl,
+      source_url: car.sourceUrl,
+      source_modified_at: car.sourceModifiedAt,
+    })),
+  );
+
+  await sql.query(
+    `
+      INSERT INTO inventory_cars (
+        id, title, brand, model, trim, year, mileage_km, price_krw, price_label,
+        source_price_man_won, source_price_label, fuel_type, transmission,
+        location, dealer_name, image_url, source_url, source_modified_at,
+        synced_at, first_seen_at, last_seen_at, is_active
+      )
+      SELECT
+        payload.id,
+        payload.title,
+        payload.brand,
+        payload.model,
+        payload.trim,
+        payload.year,
+        payload.mileage_km,
+        payload.price_krw,
+        payload.price_label,
+        payload.source_price_man_won,
+        payload.source_price_label,
+        payload.fuel_type,
+        payload.transmission,
+        payload.location,
+        payload.dealer_name,
+        payload.image_url,
+        payload.source_url,
+        payload.source_modified_at,
+        $2::timestamptz,
+        $2::timestamptz,
+        $2::timestamptz,
+        TRUE
+      FROM jsonb_to_recordset($1::jsonb) AS payload(
+        id text,
+        title text,
+        brand text,
+        model text,
+        trim text,
+        year integer,
+        mileage_km integer,
+        price_krw integer,
+        price_label text,
+        source_price_man_won integer,
+        source_price_label text,
+        fuel_type text,
+        transmission text,
+        location text,
+        dealer_name text,
+        image_url text,
+        source_url text,
+        source_modified_at timestamptz
+      )
+      ON CONFLICT (id) DO UPDATE SET
+        title = EXCLUDED.title,
+        brand = EXCLUDED.brand,
+        model = EXCLUDED.model,
+        trim = EXCLUDED.trim,
+        year = EXCLUDED.year,
+        mileage_km = EXCLUDED.mileage_km,
+        price_krw = EXCLUDED.price_krw,
+        price_label = EXCLUDED.price_label,
+        source_price_man_won = EXCLUDED.source_price_man_won,
+        source_price_label = EXCLUDED.source_price_label,
+        fuel_type = EXCLUDED.fuel_type,
+        transmission = EXCLUDED.transmission,
+        location = EXCLUDED.location,
+        dealer_name = EXCLUDED.dealer_name,
+        image_url = EXCLUDED.image_url,
+        source_url = EXCLUDED.source_url,
+        source_modified_at = EXCLUDED.source_modified_at,
+        synced_at = EXCLUDED.synced_at,
+        last_seen_at = EXCLUDED.last_seen_at,
+        is_active = TRUE
+    `,
+    [payload, seenAt],
+  );
 }
 
 async function readFilters(): Promise<CatalogFilters> {
@@ -173,6 +499,7 @@ async function readFilters(): Promise<CatalogFilters> {
     `
       SELECT DISTINCT brand
       FROM inventory_cars
+      WHERE is_active = TRUE
       ORDER BY brand ASC
     `,
   )) as Array<{ brand: string }>;
@@ -180,6 +507,7 @@ async function readFilters(): Promise<CatalogFilters> {
     `
       SELECT DISTINCT fuel_type
       FROM inventory_cars
+      WHERE is_active = TRUE
       ORDER BY fuel_type ASC
     `,
   )) as Array<{ fuel_type: string }>;
@@ -191,7 +519,7 @@ async function readFilters(): Promise<CatalogFilters> {
 }
 
 function buildWhereClause(query: CatalogQueryInput) {
-  const conditions: string[] = [];
+  const conditions = ["is_active = TRUE"];
   const params: Array<string | number> = [];
 
   if (query.brand) {
@@ -215,7 +543,7 @@ function buildWhereClause(query: CatalogQueryInput) {
   }
 
   return {
-    whereSql: conditions.length > 0 ? `WHERE ${conditions.join(" AND ")}` : "",
+    whereSql: `WHERE ${conditions.join(" AND ")}`,
     params,
   };
 }
@@ -224,128 +552,128 @@ export function isDatabaseConfigured() {
   return Boolean(process.env.DATABASE_URL);
 }
 
-export async function syncInventoryToDatabase(limit = ENCAR_SYNC_LIMIT) {
-  await ensureTables();
+export async function getInventorySyncState() {
+  return readSyncState();
+}
 
-  const inventory = await fetchLiveInventory(limit);
-  const sql = getSql();
-  const syncStartedAt = new Date().toISOString();
-  const payload = JSON.stringify(
-    inventory.cars.map((car) => ({
-      id: car.id,
-      title: car.title,
-      brand: car.brand,
-      model: car.model,
-      trim: car.trim,
-      year: car.year,
-      mileage_km: car.mileageKm,
-      price_krw: car.priceKrw,
-      price_label: car.priceLabel,
-      source_price_man_won: car.sourcePriceManWon,
-      source_price_label: car.sourcePriceLabel,
-      fuel_type: car.fuelType,
-      transmission: car.transmission,
-      location: car.location,
-      dealer_name: car.dealerName,
-      image_url: car.imageUrl,
-      source_url: car.sourceUrl,
-      source_modified_at: car.sourceModifiedAt,
-    })),
-  );
+export async function runBackfillBatch(batchSize?: number): Promise<SyncSummary> {
+  const state = await readSyncState();
+  const effectiveBatchSize = Math.max(1, batchSize ?? state.backfill_batch_size);
+  const skip = Math.max(0, state.backfill_offset);
 
-  await sql.transaction([
-    sql.query(
-      `
-        INSERT INTO inventory_cars (
-          id, title, brand, model, trim, year, mileage_km, price_krw, price_label,
-          source_price_man_won, source_price_label, fuel_type, transmission,
-          location, dealer_name, image_url, source_url, source_modified_at, synced_at
-        )
-        SELECT
-          payload.id,
-          payload.title,
-          payload.brand,
-          payload.model,
-          payload.trim,
-          payload.year,
-          payload.mileage_km,
-          payload.price_krw,
-          payload.price_label,
-          payload.source_price_man_won,
-          payload.source_price_label,
-          payload.fuel_type,
-          payload.transmission,
-          payload.location,
-          payload.dealer_name,
-          payload.image_url,
-          payload.source_url,
-          payload.source_modified_at,
-          $2::timestamptz
-        FROM jsonb_to_recordset($1::jsonb) AS payload(
-          id text,
-          title text,
-          brand text,
-          model text,
-          trim text,
-          year integer,
-          mileage_km integer,
-          price_krw integer,
-          price_label text,
-          source_price_man_won integer,
-          source_price_label text,
-          fuel_type text,
-          transmission text,
-          location text,
-          dealer_name text,
-          image_url text,
-          source_url text,
-          source_modified_at timestamptz
-        )
-        ON CONFLICT (id) DO UPDATE SET
-          title = EXCLUDED.title,
-          brand = EXCLUDED.brand,
-          model = EXCLUDED.model,
-          trim = EXCLUDED.trim,
-          year = EXCLUDED.year,
-          mileage_km = EXCLUDED.mileage_km,
-          price_krw = EXCLUDED.price_krw,
-          price_label = EXCLUDED.price_label,
-          source_price_man_won = EXCLUDED.source_price_man_won,
-          source_price_label = EXCLUDED.source_price_label,
-          fuel_type = EXCLUDED.fuel_type,
-          transmission = EXCLUDED.transmission,
-          location = EXCLUDED.location,
-          dealer_name = EXCLUDED.dealer_name,
-          image_url = EXCLUDED.image_url,
-          source_url = EXCLUDED.source_url,
-          source_modified_at = EXCLUDED.source_modified_at,
-          synced_at = EXCLUDED.synced_at
-      `,
-      [payload, syncStartedAt],
-    ),
-    sql.query(`DELETE FROM inventory_cars WHERE synced_at < $1::timestamptz`, [syncStartedAt]),
-    sql.query(
-      `
-        INSERT INTO inventory_sync_state (
-          key_name, source_count, synced_count, fetched_at, query
-        )
-        VALUES ('primary', $1, $2, $3, $4)
-        ON CONFLICT (key_name) DO UPDATE SET
-          source_count = EXCLUDED.source_count,
-          synced_count = EXCLUDED.synced_count,
-          fetched_at = EXCLUDED.fetched_at,
-          query = EXCLUDED.query
-      `,
-      [
-        inventory.meta.sourceCount,
-        inventory.meta.syncedCount,
-        inventory.meta.fetchedAt,
-        inventory.meta.query,
-      ],
-    ),
-  ]);
+  if (state.backfill_complete && state.source_count > 0) {
+    return {
+      mode: "backfill",
+      fetchedAt: new Date(state.fetched_at).toISOString(),
+      sourceCount: state.source_count,
+      syncedCount: state.synced_count,
+      batchSize: effectiveBatchSize,
+      batchCars: 0,
+      backfillOffset: state.backfill_offset,
+      backfillComplete: true,
+    };
+  }
 
-  return getDatabaseInventory(limit);
+  const batch = await fetchInventoryBatch(skip, effectiveBatchSize);
+  const seenAt = new Date().toISOString();
+  await upsertCars(batch.inventory.cars, seenAt);
+
+  const syncedCount = await countActiveCars();
+  const nextOffset = Math.min(batch.inventory.meta.sourceCount, batch.nextSkip);
+  const backfillComplete =
+    nextOffset >= batch.inventory.meta.sourceCount ||
+    batch.inventory.cars.length === 0 ||
+    batch.exhausted;
+
+  await saveSyncState({
+    ...state,
+    source_count: batch.inventory.meta.sourceCount,
+    synced_count: syncedCount,
+    fetched_at: batch.inventory.meta.fetchedAt,
+    query: batch.inventory.meta.query,
+    backfill_offset: nextOffset,
+    backfill_complete: backfillComplete,
+    last_backfill_at: seenAt,
+  });
+
+    return {
+      mode: "backfill",
+      fetchedAt: batch.inventory.meta.fetchedAt,
+      sourceCount: batch.inventory.meta.sourceCount,
+      syncedCount,
+      batchSize: effectiveBatchSize,
+      batchCars: batch.inventory.cars.length,
+      backfillOffset: nextOffset,
+      backfillComplete,
+    };
+}
+
+export async function runIncrementalRefresh(refreshLimit?: number): Promise<SyncSummary> {
+  const state = await readSyncState();
+  const effectiveRefreshLimit = Math.max(1, refreshLimit ?? state.recent_refresh_limit);
+  const batch = await fetchInventoryBatch(0, effectiveRefreshLimit);
+  const seenAt = new Date().toISOString();
+
+  await upsertCars(batch.inventory.cars, seenAt);
+
+  const syncedCount = await countActiveCars();
+  const nextBackfillOffset =
+    state.backfill_offset === 0
+      ? Math.min(batch.nextSkip, batch.inventory.meta.sourceCount)
+      : state.backfill_offset;
+
+  await saveSyncState({
+    ...state,
+    source_count: batch.inventory.meta.sourceCount,
+    synced_count: syncedCount,
+    fetched_at: batch.inventory.meta.fetchedAt,
+    query: batch.inventory.meta.query,
+    backfill_offset: nextBackfillOffset,
+    last_refresh_at: seenAt,
+  });
+
+  return {
+    mode: "refresh",
+    fetchedAt: batch.inventory.meta.fetchedAt,
+    sourceCount: batch.inventory.meta.sourceCount,
+    syncedCount,
+    batchSize: effectiveRefreshLimit,
+    batchCars: batch.inventory.cars.length,
+    backfillOffset: nextBackfillOffset,
+    backfillComplete: state.backfill_complete,
+  };
+}
+
+export async function runScheduledInventorySync(): Promise<ScheduledSyncResult> {
+  const actions: string[] = [];
+  const state = await readSyncState();
+  let refresh: SyncSummary | null = null;
+  let backfill: SyncSummary | null = null;
+
+  if (state.backfill_complete || state.backfill_offset >= state.recent_refresh_limit) {
+    refresh = await runIncrementalRefresh(state.recent_refresh_limit);
+    actions.push("refresh");
+  }
+
+  const refreshedState = await readSyncState();
+  if (!refreshedState.backfill_complete) {
+    backfill = await runBackfillBatch(refreshedState.backfill_batch_size);
+    actions.push("backfill");
+  } else if (!refresh) {
+    refresh = await runIncrementalRefresh(refreshedState.recent_refresh_limit);
+    actions.push("refresh");
+  }
+
+  const finalState = await readSyncState();
+  const inventory = await getDatabaseInventory(finalState.recent_refresh_limit);
+
+  return {
+    actions,
+    state: finalState,
+    inventory,
+    refresh,
+    backfill,
+  };
 }
 
 export async function getDatabaseInventory(limit = ENCAR_SYNC_LIMIT): Promise<InventoryPayload> {
@@ -360,13 +688,14 @@ export async function getDatabaseInventory(limit = ENCAR_SYNC_LIMIT): Promise<In
         source_price_man_won, source_price_label, fuel_type, transmission, location,
         dealer_name, image_url, source_url, source_modified_at
       FROM inventory_cars
+      WHERE is_active = TRUE
       ORDER BY source_modified_at DESC, id DESC
       LIMIT $1
     `,
     [limit],
   )) as InventoryRow[];
 
-  if (!state || rows.length === 0) {
+  if (rows.length === 0) {
     throw new Error("Database inventory is empty");
   }
 
@@ -394,12 +723,8 @@ export async function getDatabaseCatalog(
 
   const sql = getSql();
   const state = await readSyncState();
-
-  if (!state) {
-    throw new Error("Database sync state is missing");
-  }
-
   const { whereSql, params } = buildWhereClause(query);
+
   const countRows = (await sql.query(
     `
       SELECT COUNT(*)::int AS total
