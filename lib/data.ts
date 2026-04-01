@@ -5,6 +5,11 @@ import {
   type InventoryPayload,
   type InventoryCar,
 } from "@/lib/encar";
+import {
+  getDatabaseCatalog,
+  getDatabaseInventory,
+  isDatabaseConfigured,
+} from "@/lib/postgres-inventory";
 
 export type CatalogQuery = {
   page: number;
@@ -33,6 +38,12 @@ export type CatalogResult = {
 export const CATALOG_PAGE_SIZE = 18;
 
 export async function getInventory(limit = ENCAR_SYNC_LIMIT): Promise<InventoryPayload> {
+  if (isDatabaseConfigured()) {
+    try {
+      return await getDatabaseInventory(limit);
+    } catch {}
+  }
+
   try {
     return await fetchLiveInventory(limit);
   } catch {
@@ -64,6 +75,23 @@ export function parseCatalogQuery(
 }
 
 export async function getCatalog(query: CatalogQuery): Promise<CatalogResult> {
+  if (isDatabaseConfigured()) {
+    try {
+      const databaseCatalog = await getDatabaseCatalog(query, CATALOG_PAGE_SIZE);
+
+      return {
+        cars: databaseCatalog.cars,
+        inventory: databaseCatalog.inventory,
+        filters: databaseCatalog.filters,
+        query: {
+          ...query,
+          page: databaseCatalog.pagination.page,
+        },
+        pagination: databaseCatalog.pagination,
+      };
+    } catch {}
+  }
+
   const inventory = await getInventory(ENCAR_SYNC_LIMIT);
 
   const collator = new Intl.Collator("ko");

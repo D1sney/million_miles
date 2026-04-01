@@ -63,7 +63,7 @@ export type InventoryCar = {
 export type InventoryPayload = {
   cars: InventoryCar[];
   meta: {
-    source: "live" | "snapshot";
+    source: "live" | "snapshot" | "database";
     sourceCount: number;
     syncedCount: number;
     displayedCount: number;

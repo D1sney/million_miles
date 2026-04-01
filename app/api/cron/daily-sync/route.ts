@@ -1,5 +1,6 @@
 import { revalidatePath, revalidateTag } from "next/cache";
-import { fetchLiveInventory, ENCAR_CACHE_TAG, ENCAR_SYNC_LIMIT } from "@/lib/encar";
+import { ENCAR_CACHE_TAG, ENCAR_SYNC_LIMIT } from "@/lib/encar";
+import { syncInventoryToDatabase } from "@/lib/postgres-inventory";
 
 export async function GET(request: Request) {
   const authHeader = request.headers.get("authorization");
@@ -13,7 +14,7 @@ export async function GET(request: Request) {
   revalidatePath("/");
   revalidatePath("/api/cars");
 
-  const inventory = await fetchLiveInventory(ENCAR_SYNC_LIMIT);
+  const inventory = await syncInventoryToDatabase(ENCAR_SYNC_LIMIT);
 
   return Response.json({
     ok: true,

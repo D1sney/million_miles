@@ -85,7 +85,11 @@ export default async function Home({ searchParams }: PageProps) {
             </p>
           </div>
           <div className="rounded-full border border-white/15 bg-white/8 px-4 py-2 text-right text-xs uppercase tracking-[0.22em] text-white/72">
-            {inventory.meta.source === "live" ? "Live daily sync" : "Snapshot fallback"}
+            {inventory.meta.source === "database"
+              ? "Postgres daily sync"
+              : inventory.meta.source === "live"
+                ? "Live daily sync"
+                : "Snapshot fallback"}
           </div>
         </div>
       </section>
