@@ -93,6 +93,7 @@ type ScheduledSyncResult = {
 const SYNC_STATE_KEY = "primary";
 const DEFAULT_BACKFILL_BATCH_SIZE = 3000;
 const DEFAULT_REFRESH_LIMIT = ENCAR_SYNC_LIMIT;
+let ensureTablesPromise: Promise<void> | null = null;
 
 function getSql() {
   const databaseUrl = process.env.DATABASE_URL;
@@ -306,9 +307,18 @@ async function ensureTables() {
   `);
 }
 
-async function readSyncState() {
-  await ensureTables();
+async function ensureTablesReady() {
+  if (!ensureTablesPromise) {
+    ensureTablesPromise = ensureTables().catch((error) => {
+      ensureTablesPromise = null;
+      throw error;
+    });
+  }
 
+  await ensureTablesPromise;
+}
+
+async function readSyncState() {
   const sql = getSql();
   const rows = (await sql.query(
     `
@@ -553,10 +563,12 @@ export function isDatabaseConfigured() {
 }
 
 export async function getInventorySyncState() {
+  await ensureTablesReady();
   return readSyncState();
 }
 
 export async function runBackfillBatch(batchSize?: number): Promise<SyncSummary> {
+  await ensureTablesReady();
   const state = await readSyncState();
   const effectiveBatchSize = Math.max(1, batchSize ?? state.backfill_batch_size);
   const skip = Math.max(0, state.backfill_offset);
@@ -609,6 +621,7 @@ export async function runBackfillBatch(batchSize?: number): Promise<SyncSummary>
 }
 
 export async function runIncrementalRefresh(refreshLimit?: number): Promise<SyncSummary> {
+  await ensureTablesReady();
   const state = await readSyncState();
   const effectiveRefreshLimit = Math.max(1, refreshLimit ?? state.recent_refresh_limit);
   const batch = await fetchInventoryBatch(0, effectiveRefreshLimit);
@@ -645,6 +658,7 @@ export async function runIncrementalRefresh(refreshLimit?: number): Promise<Sync
 }
 
 export async function runScheduledInventorySync(): Promise<ScheduledSyncResult> {
+  await ensureTablesReady();
   const actions: string[] = [];
   const state = await readSyncState();
   let refresh: SyncSummary | null = null;
@@ -677,7 +691,7 @@ export async function runScheduledInventorySync(): Promise<ScheduledSyncResult> 
 }
 
 export async function getDatabaseInventory(limit = ENCAR_SYNC_LIMIT): Promise<InventoryPayload> {
-  await ensureTables();
+  await ensureTablesReady();
 
   const sql = getSql();
   const state = await readSyncState();
@@ -719,22 +733,27 @@ export async function getDatabaseCatalog(
   query: CatalogQueryInput,
   pageSize: number,
 ): Promise<DatabaseCatalogResult> {
-  await ensureTables();
+  await ensureTablesReady();
 
   const sql = getSql();
-  const state = await readSyncState();
   const { whereSql, params } = buildWhereClause(query);
-
-  const countRows = (await sql.query(
+  const countPromise = sql.query(
     `
       SELECT COUNT(*)::int AS total
       FROM inventory_cars
       ${whereSql}
     `,
     params,
-  )) as Array<{ total: number }>;
+  );
 
-  const totalFiltered = Number(countRows[0]?.total ?? 0);
+  const [state, filters, countRows] = await Promise.all([
+    readSyncState(),
+    readFilters(),
+    countPromise,
+  ]);
+  const typedCountRows = countRows as Array<{ total: number }>;
+
+  const totalFiltered = Number(typedCountRows[0]?.total ?? 0);
   const totalPages = Math.max(1, Math.ceil(Math.max(totalFiltered, 1) / pageSize));
   const page = Math.min(query.page, totalPages);
   const offset = (page - 1) * pageSize;
@@ -753,8 +772,6 @@ export async function getDatabaseCatalog(
     `,
     [...params, pageSize, offset],
   )) as InventoryRow[];
-
-  const filters = await readFilters();
   const cars = rows.map(rowToCar);
 
   return {

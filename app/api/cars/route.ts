@@ -1,6 +1,8 @@
 import { NextResponse } from "next/server";
 import { getCatalog, parseCatalogQuery } from "@/lib/data";
 
+export const preferredRegion = "fra1";
+
 export async function GET(request: Request) {
   const { searchParams } = new URL(request.url);
   const catalog = await getCatalog(

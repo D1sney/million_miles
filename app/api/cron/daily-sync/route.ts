@@ -7,6 +7,8 @@ import {
   runScheduledInventorySync,
 } from "@/lib/postgres-inventory";
 
+export const preferredRegion = "fra1";
+
 export async function GET(request: Request) {
   const authHeader = request.headers.get("authorization");
   const cronSecret = process.env.CRON_SECRET;

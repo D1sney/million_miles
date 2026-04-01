@@ -3,6 +3,7 @@ import { CarCard } from "@/components/car-card";
 import { getCatalog, parseCatalogQuery } from "@/lib/data";
 
 export const dynamic = "force-dynamic";
+export const preferredRegion = "fra1";
 
 type PageProps = {
   searchParams?: Promise<Record<string, string | string[] | undefined>>;
