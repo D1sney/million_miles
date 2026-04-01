@@ -9,6 +9,7 @@ export const ENCAR_DAILY_REVALIDATE_SECONDS = 60 * 60 * 24;
 export const ENCAR_CACHE_TAG = "inventory";
 export const ENCAR_SYNC_LIMIT = 1200;
 export const ENCAR_CHUNK_SIZE = 100;
+const ENCAR_FETCH_RETRY_COUNT = 3;
 const FALLBACK_IMAGE =
   "data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 1200 900'%3E%3Crect width='1200' height='900' fill='%23e8dece'/%3E%3Ccircle cx='962' cy='190' r='124' fill='%23bf9152' fill-opacity='.18'/%3E%3Cpath d='M160 664l166-198a36 36 0 0 1 56 0l114 136 172-208a36 36 0 0 1 56 0l316 370H160Z' fill='%23151515' fill-opacity='.16'/%3E%3Ctext x='160' y='208' fill='%23151515' fill-opacity='.75' font-family='Arial, sans-serif' font-size='76' font-weight='700'%3EMillion Miles%3C/text%3E%3Ctext x='160' y='286' fill='%236d655c' font-family='Arial, sans-serif' font-size='34'%3EImage temporarily unavailable%3C/text%3E%3C/svg%3E";
 
@@ -162,6 +163,10 @@ function normalizeResponse(raw: RawResponse, source: "live" | "snapshot"): Inven
   };
 }
 
+function sleep(ms: number) {
+  return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
 export async function fetchInventoryBatch(skip: number, limit: number): Promise<InventoryBatchResult> {
   const safeSkip = Math.max(0, skip);
   const targetCount = Math.max(1, limit);
@@ -171,8 +176,26 @@ export async function fetchInventoryBatch(skip: number, limit: number): Promise<
   let safetyCounter = 0;
 
   while (deduped.size < targetCount) {
-    const currentLimit = Math.min(ENCAR_CHUNK_SIZE, targetCount);
-    const raw = await fetchEncarChunk(currentSkip, currentLimit);
+    const remaining = targetCount - deduped.size;
+    let currentLimit = Math.min(ENCAR_CHUNK_SIZE, remaining);
+    let raw: RawResponse | null = null;
+
+    while (currentLimit >= 1 && !raw) {
+      try {
+        raw = await fetchEncarChunk(currentSkip, currentLimit);
+      } catch (error) {
+        if (currentLimit === 1) {
+          throw error;
+        }
+
+        currentLimit = Math.max(1, Math.floor(currentLimit / 2));
+      }
+    }
+
+    if (!raw) {
+      break;
+    }
+
     sourceCount = raw.Count;
     for (const car of raw.SearchResults) {
       deduped.set(car.Id, car);
@@ -254,27 +277,39 @@ async function fetchEncarChunk(skip: number, limit: number): Promise<RawResponse
   url.searchParams.set("count", "true");
   url.searchParams.set("q", ENCAR_QUERY);
   url.searchParams.set("sr", `|ModifiedDate|${skip}|${limit}`);
-  const response = await fetch(url, {
-    headers: {
-      "User-Agent": "Mozilla/5.0",
-      Accept: "application/json",
-    },
-    next: {
-      revalidate: ENCAR_DAILY_REVALIDATE_SECONDS,
-      tags: [ENCAR_CACHE_TAG],
-    },
-  });
+  let lastError: Error | null = null;
 
-  if (!response.ok) {
-    throw new Error(`ENCAR upstream failed with ${response.status}`);
+  for (let attempt = 0; attempt < ENCAR_FETCH_RETRY_COUNT; attempt += 1) {
+    const response = await fetch(url, {
+      headers: {
+        "User-Agent": "Mozilla/5.0",
+        Accept: "application/json",
+      },
+      next: {
+        revalidate: ENCAR_DAILY_REVALIDATE_SECONDS,
+        tags: [ENCAR_CACHE_TAG],
+      },
+    });
+
+    if (response.ok) {
+      const raw = (await response.json()) as RawResponse;
+      if (!Array.isArray(raw.SearchResults) || typeof raw.Count !== "number") {
+        throw new Error("ENCAR response shape is invalid");
+      }
+
+      return raw;
+    }
+
+    lastError = new Error(`ENCAR upstream failed with ${response.status} for skip=${skip} limit=${limit}`);
+    if (response.status >= 500 && attempt < ENCAR_FETCH_RETRY_COUNT - 1) {
+      await sleep(300 * (attempt + 1));
+      continue;
+    }
+
+    throw lastError;
   }
 
-  const raw = (await response.json()) as RawResponse;
-  if (!Array.isArray(raw.SearchResults) || typeof raw.Count !== "number") {
-    throw new Error("ENCAR response shape is invalid");
-  }
-
-  return raw;
+  throw lastError ?? new Error(`ENCAR upstream failed for skip=${skip} limit=${limit}`);
 }
 
 export async function fetchLiveInventory(limit = ENCAR_SYNC_LIMIT): Promise<InventoryPayload> {
