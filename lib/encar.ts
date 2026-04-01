@@ -7,6 +7,8 @@ export const ENCAR_DETAIL_BASE =
   "https://www.encar.com/dc/dc_cardetailview.do?carType=kor&carid=";
 export const ENCAR_DAILY_REVALIDATE_SECONDS = 60 * 60 * 24;
 export const ENCAR_CACHE_TAG = "inventory";
+export const ENCAR_SYNC_LIMIT = 180;
+export const ENCAR_CHUNK_SIZE = 60;
 const FALLBACK_IMAGE =
   "data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 1200 900'%3E%3Crect width='1200' height='900' fill='%23e8dece'/%3E%3Ccircle cx='962' cy='190' r='124' fill='%23bf9152' fill-opacity='.18'/%3E%3Cpath d='M160 664l166-198a36 36 0 0 1 56 0l114 136 172-208a36 36 0 0 1 56 0l316 370H160Z' fill='%23151515' fill-opacity='.16'/%3E%3Ctext x='160' y='208' fill='%23151515' fill-opacity='.75' font-family='Arial, sans-serif' font-size='76' font-weight='700'%3EMillion Miles%3C/text%3E%3Ctext x='160' y='286' fill='%236d655c' font-family='Arial, sans-serif' font-size='34'%3EImage temporarily unavailable%3C/text%3E%3C/svg%3E";
 
@@ -63,6 +65,7 @@ export type InventoryPayload = {
   meta: {
     source: "live" | "snapshot";
     sourceCount: number;
+    syncedCount: number;
     displayedCount: number;
     fetchedAt: string;
     fetchedLabel: string;
@@ -139,6 +142,7 @@ function normalizeResponse(raw: RawResponse, source: "live" | "snapshot"): Inven
     meta: {
       source,
       sourceCount: raw.Count,
+      syncedCount: cars.length,
       displayedCount: cars.length,
       fetchedAt,
       fetchedLabel: new Intl.DateTimeFormat("en-GB", {
@@ -161,12 +165,19 @@ function isInventoryPayload(value: unknown): value is InventoryPayload {
 
 export function getSnapshotInventory(limit?: number): InventoryPayload {
   const safeSnapshot = isInventoryPayload(snapshot)
-    ? snapshot
+    ? {
+        ...snapshot,
+        meta: {
+          ...snapshot.meta,
+          syncedCount: snapshot.meta.syncedCount ?? snapshot.cars.length,
+        },
+      }
     : {
         cars: [],
         meta: {
           source: "snapshot" as const,
           sourceCount: 0,
+          syncedCount: 0,
           displayedCount: 0,
           fetchedAt: new Date().toISOString(),
           fetchedLabel: "Unavailable",
@@ -188,12 +199,11 @@ export function getSnapshotInventory(limit?: number): InventoryPayload {
   };
 }
 
-export async function fetchLiveInventory(limit = 18): Promise<InventoryPayload> {
+async function fetchEncarChunk(skip: number, limit: number): Promise<RawResponse> {
   const url = new URL(ENCAR_ENDPOINT);
   url.searchParams.set("count", "true");
   url.searchParams.set("q", ENCAR_QUERY);
-  url.searchParams.set("sr", `|ModifiedDate|0|${limit}`);
-
+  url.searchParams.set("sr", `|ModifiedDate|${skip}|${limit}`);
   const response = await fetch(url, {
     headers: {
       "User-Agent": "Mozilla/5.0",
@@ -214,7 +224,38 @@ export async function fetchLiveInventory(limit = 18): Promise<InventoryPayload> 
     throw new Error("ENCAR response shape is invalid");
   }
 
-  return normalizeResponse(raw, "live");
+  return raw;
+}
+
+export async function fetchLiveInventory(limit = ENCAR_SYNC_LIMIT): Promise<InventoryPayload> {
+  const targetCount = Math.max(1, limit);
+  const chunks = Math.ceil(targetCount / ENCAR_CHUNK_SIZE);
+  const aggregated: RawCar[] = [];
+  let sourceCount = 0;
+
+  for (let index = 0; index < chunks; index += 1) {
+    const skip = index * ENCAR_CHUNK_SIZE;
+    const currentLimit = Math.min(ENCAR_CHUNK_SIZE, targetCount - aggregated.length);
+    const raw = await fetchEncarChunk(skip, currentLimit);
+    sourceCount = raw.Count;
+    aggregated.push(...raw.SearchResults);
+
+    if (aggregated.length >= targetCount || raw.SearchResults.length < currentLimit) {
+      break;
+    }
+  }
+
+  const deduped = Array.from(
+    new Map(aggregated.map((car) => [car.Id, car])).values(),
+  ).slice(0, targetCount);
+
+  return normalizeResponse(
+    {
+      Count: sourceCount,
+      SearchResults: deduped,
+    },
+    "live",
+  );
 }
 
 export function validateInventoryPayload(payload: InventoryPayload) {

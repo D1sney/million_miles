@@ -7,7 +7,8 @@ const ENCAR_ENDPOINT = "https://api.encar.com/search/car/list/premium";
 const ENCAR_IMAGE_BASE = "https://ci.encar.com/carpicture";
 const ENCAR_DETAIL_BASE =
   "https://www.encar.com/dc/dc_cardetailview.do?carType=kor&carid=";
-const LIMIT = 18;
+const LIMIT = Number.parseInt(process.env.ENCAR_SYNC_LIMIT ?? "180", 10);
+const CHUNK_SIZE = 60;
 const FALLBACK_IMAGE =
   "data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 1200 900'%3E%3Crect width='1200' height='900' fill='%23e8dece'/%3E%3Ccircle cx='962' cy='190' r='124' fill='%23bf9152' fill-opacity='.18'/%3E%3Cpath d='M160 664l166-198a36 36 0 0 1 56 0l114 136 172-208a36 36 0 0 1 56 0l316 370H160Z' fill='%23151515' fill-opacity='.16'/%3E%3Ctext x='160' y='208' fill='%23151515' fill-opacity='.75' font-family='Arial, sans-serif' font-size='76' font-weight='700'%3EMillion Miles%3C/text%3E%3Ctext x='160' y='286' fill='%236d655c' font-family='Arial, sans-serif' font-size='34'%3EImage temporarily unavailable%3C/text%3E%3C/svg%3E";
 
@@ -66,31 +67,49 @@ function normalizeCar(raw) {
 }
 
 async function main() {
-  const url = new URL(ENCAR_ENDPOINT);
-  url.searchParams.set("count", "true");
-  url.searchParams.set("q", ENCAR_QUERY);
-  url.searchParams.set("sr", `|ModifiedDate|0|${LIMIT}`);
+  const aggregated = [];
+  let sourceCount = 0;
+  const chunks = Math.ceil(Math.max(1, LIMIT) / CHUNK_SIZE);
 
-  const response = await fetch(url, {
-    headers: {
-      "User-Agent": "Mozilla/5.0",
-      Accept: "application/json",
-    },
-  });
+  for (let index = 0; index < chunks; index += 1) {
+    const skip = index * CHUNK_SIZE;
+    const currentLimit = Math.min(CHUNK_SIZE, LIMIT - aggregated.length);
+    const url = new URL(ENCAR_ENDPOINT);
+    url.searchParams.set("count", "true");
+    url.searchParams.set("q", ENCAR_QUERY);
+    url.searchParams.set("sr", `|ModifiedDate|${skip}|${currentLimit}`);
 
-  if (!response.ok) {
-    throw new Error(`ENCAR upstream failed with ${response.status}`);
+    const response = await fetch(url, {
+      headers: {
+        "User-Agent": "Mozilla/5.0",
+        Accept: "application/json",
+      },
+    });
+
+    if (!response.ok) {
+      throw new Error(`ENCAR upstream failed with ${response.status}`);
+    }
+
+    const rawChunk = await response.json();
+    sourceCount = rawChunk.Count || sourceCount;
+    aggregated.push(...(rawChunk.SearchResults || []));
+
+    if (aggregated.length >= LIMIT || (rawChunk.SearchResults || []).length < currentLimit) {
+      break;
+    }
   }
 
-  const raw = await response.json();
-  const cars = (raw.SearchResults || []).map(normalizeCar);
+  const cars = Array.from(new Map(aggregated.map((car) => [car.Id, car])).values())
+    .slice(0, LIMIT)
+    .map(normalizeCar);
   const fetchedAt = new Date().toISOString();
 
   const payload = {
     cars,
     meta: {
       source: "snapshot",
-      sourceCount: raw.Count || cars.length,
+      sourceCount,
+      syncedCount: cars.length,
       displayedCount: cars.length,
       fetchedAt,
       fetchedLabel: new Intl.DateTimeFormat("en-GB", {
