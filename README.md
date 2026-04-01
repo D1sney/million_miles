@@ -1,26 +1,41 @@
 # Million Miles x ENCAR
 
-Premium landing page for ENCAR inventory with a daily live sync strategy and a local JSON fallback.
+Next.js каталог автомобилей с данными из ENCAR.
 
-## Scripts
+Прод:
+- [millon-miles-encar.vercel.app](https://millon-miles-encar.vercel.app)
+
+Что есть сейчас:
+- лендинг и каталог на Next.js
+- JSON API: `/api/cars`
+- пагинация и базовые фильтры
+- ежедневный sync на Vercel
+- локальный snapshot в `data/cars.json`
+
+## Запуск
 
 ```bash
+npm install
 npm run dev
-npm run sync:data
-npm run validate:data
-npm run check
 ```
 
-## Data strategy
+## Полезные команды
 
-- Production prefers a live ENCAR API fetch with `revalidate: 86400`.
-- Local `data/cars.json` is the fail-safe snapshot and is also exposed through `/api/cars`.
-- `scripts/fetch-encar.mjs` refreshes the snapshot from ENCAR.
-- `scripts/validate-cars.mjs` checks that the snapshot is non-empty, deduplicated, and structurally sound.
+```bash
+npm run sync:data
+npm run validate:data
+npm run lint
+npm run build
+```
 
-## Source references
+## Источник данных
 
-- ENCAR search page: `https://www.encar.com/dc/dc_carsearchlist.do?carType=kor`
 - ENCAR API: `https://api.encar.com/search/car/list/premium`
-- ENCAR image CDN: `https://ci.encar.com/carpicture`
-- UX reference: `https://millionmiles.ae/cars`
+- ENCAR images: `https://ci.encar.com/carpicture`
+
+## Стек
+
+- Next.js
+- TypeScript
+- Tailwind CSS
+- Vercel
