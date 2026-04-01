@@ -1,5 +1,5 @@
 import { revalidatePath, revalidateTag } from "next/cache";
-import { fetchLiveInventory, ENCAR_CACHE_TAG } from "@/lib/encar";
+import { fetchLiveInventory, ENCAR_CACHE_TAG, ENCAR_SYNC_LIMIT } from "@/lib/encar";
 
 export async function GET(request: Request) {
   const authHeader = request.headers.get("authorization");
@@ -13,13 +13,14 @@ export async function GET(request: Request) {
   revalidatePath("/");
   revalidatePath("/api/cars");
 
-  const inventory = await fetchLiveInventory(18);
+  const inventory = await fetchLiveInventory(ENCAR_SYNC_LIMIT);
 
   return Response.json({
     ok: true,
     refreshedAt: new Date().toISOString(),
     source: inventory.meta.source,
     sourceCount: inventory.meta.sourceCount,
+    syncedCount: inventory.meta.syncedCount,
     displayedCount: inventory.meta.displayedCount,
   });
 }
