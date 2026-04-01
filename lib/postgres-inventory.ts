@@ -229,19 +229,77 @@ export async function syncInventoryToDatabase(limit = ENCAR_SYNC_LIMIT) {
 
   const inventory = await fetchLiveInventory(limit);
   const sql = getSql();
+  const syncStartedAt = new Date().toISOString();
+  const payload = JSON.stringify(
+    inventory.cars.map((car) => ({
+      id: car.id,
+      title: car.title,
+      brand: car.brand,
+      model: car.model,
+      trim: car.trim,
+      year: car.year,
+      mileage_km: car.mileageKm,
+      price_krw: car.priceKrw,
+      price_label: car.priceLabel,
+      source_price_man_won: car.sourcePriceManWon,
+      source_price_label: car.sourcePriceLabel,
+      fuel_type: car.fuelType,
+      transmission: car.transmission,
+      location: car.location,
+      dealer_name: car.dealerName,
+      image_url: car.imageUrl,
+      source_url: car.sourceUrl,
+      source_modified_at: car.sourceModifiedAt,
+    })),
+  );
 
-  for (const car of inventory.cars) {
-    await sql.query(
+  await sql.transaction([
+    sql.query(
       `
         INSERT INTO inventory_cars (
           id, title, brand, model, trim, year, mileage_km, price_krw, price_label,
           source_price_man_won, source_price_label, fuel_type, transmission,
           location, dealer_name, image_url, source_url, source_modified_at, synced_at
         )
-        VALUES (
-          $1, $2, $3, $4, $5, $6, $7, $8, $9,
-          $10, $11, $12, $13,
-          $14, $15, $16, $17, $18, NOW()
+        SELECT
+          payload.id,
+          payload.title,
+          payload.brand,
+          payload.model,
+          payload.trim,
+          payload.year,
+          payload.mileage_km,
+          payload.price_krw,
+          payload.price_label,
+          payload.source_price_man_won,
+          payload.source_price_label,
+          payload.fuel_type,
+          payload.transmission,
+          payload.location,
+          payload.dealer_name,
+          payload.image_url,
+          payload.source_url,
+          payload.source_modified_at,
+          $2::timestamptz
+        FROM jsonb_to_recordset($1::jsonb) AS payload(
+          id text,
+          title text,
+          brand text,
+          model text,
+          trim text,
+          year integer,
+          mileage_km integer,
+          price_krw integer,
+          price_label text,
+          source_price_man_won integer,
+          source_price_label text,
+          fuel_type text,
+          transmission text,
+          location text,
+          dealer_name text,
+          image_url text,
+          source_url text,
+          source_modified_at timestamptz
         )
         ON CONFLICT (id) DO UPDATE SET
           title = EXCLUDED.title,
@@ -261,58 +319,31 @@ export async function syncInventoryToDatabase(limit = ENCAR_SYNC_LIMIT) {
           image_url = EXCLUDED.image_url,
           source_url = EXCLUDED.source_url,
           source_modified_at = EXCLUDED.source_modified_at,
-          synced_at = NOW()
+          synced_at = EXCLUDED.synced_at
+      `,
+      [payload, syncStartedAt],
+    ),
+    sql.query(`DELETE FROM inventory_cars WHERE synced_at < $1::timestamptz`, [syncStartedAt]),
+    sql.query(
+      `
+        INSERT INTO inventory_sync_state (
+          key_name, source_count, synced_count, fetched_at, query
+        )
+        VALUES ('primary', $1, $2, $3, $4)
+        ON CONFLICT (key_name) DO UPDATE SET
+          source_count = EXCLUDED.source_count,
+          synced_count = EXCLUDED.synced_count,
+          fetched_at = EXCLUDED.fetched_at,
+          query = EXCLUDED.query
       `,
       [
-        car.id,
-        car.title,
-        car.brand,
-        car.model,
-        car.trim,
-        car.year,
-        car.mileageKm,
-        car.priceKrw,
-        car.priceLabel,
-        car.sourcePriceManWon,
-        car.sourcePriceLabel,
-        car.fuelType,
-        car.transmission,
-        car.location,
-        car.dealerName,
-        car.imageUrl,
-        car.sourceUrl,
-        car.sourceModifiedAt,
+        inventory.meta.sourceCount,
+        inventory.meta.syncedCount,
+        inventory.meta.fetchedAt,
+        inventory.meta.query,
       ],
-    );
-  }
-
-  if (inventory.cars.length > 0) {
-    const placeholders = inventory.cars.map((_, index) => `$${index + 1}`).join(", ");
-    await sql.query(
-      `DELETE FROM inventory_cars WHERE id NOT IN (${placeholders})`,
-      inventory.cars.map((car) => car.id),
-    );
-  }
-
-  await sql.query(
-    `
-      INSERT INTO inventory_sync_state (
-        key_name, source_count, synced_count, fetched_at, query
-      )
-      VALUES ('primary', $1, $2, $3, $4)
-      ON CONFLICT (key_name) DO UPDATE SET
-        source_count = EXCLUDED.source_count,
-        synced_count = EXCLUDED.synced_count,
-        fetched_at = EXCLUDED.fetched_at,
-        query = EXCLUDED.query
-    `,
-    [
-      inventory.meta.sourceCount,
-      inventory.meta.syncedCount,
-      inventory.meta.fetchedAt,
-      inventory.meta.query,
-    ],
-  );
+    ),
+  ]);
 
   return getDatabaseInventory(limit);
 }
